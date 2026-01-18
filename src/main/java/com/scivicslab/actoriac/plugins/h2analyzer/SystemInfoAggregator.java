@@ -532,78 +532,14 @@ public class SystemInfoAggregator implements CallableByActionName, ActorSystemAw
 
         try {
             long sessionId = resolveSessionId(sessionIdStr);
-
-            // Extract CPU-related log entries (lscpu output)
-            String sql = "SELECT node_id, message FROM logs " +
-                         "WHERE session_id = ? AND message LIKE '%CPU INFO%' " +
-                         "ORDER BY node_id, timestamp";
-
-            Map<String, CpuInfo> nodeCpus = new LinkedHashMap<>();
-
-            try (PreparedStatement ps = connection.prepareStatement(sql)) {
-                ps.setLong(1, sessionId);
-                try (ResultSet rs = ps.executeQuery()) {
-                    while (rs.next()) {
-                        String nodeId = rs.getString("node_id");
-                        String message = rs.getString("message");
-
-                        CpuInfo cpu = nodeCpus.computeIfAbsent(nodeId, k -> new CpuInfo());
-
-                        // Parse each line in the multi-line message
-                        for (String line : message.split("\n")) {
-                            // Strip node prefix like [node-192.168.5.13]
-                            String cleanLine = line.replaceFirst("^\\[node-[^\\]]+\\]\\s*", "").trim();
-
-                            // Parse: Model name: Intel(R) Core(TM) i7-10700 CPU @ 2.90GHz
-                            if (cleanLine.startsWith("Model name:")) {
-                                cpu.model = cleanLine.replaceFirst("Model name:\\s*", "").trim();
-                            }
-                            // Parse: CPU(s): 16
-                            else if (cleanLine.startsWith("CPU(s):")) {
-                                Matcher m = Pattern.compile("CPU\\(s\\):\\s*(\\d+)").matcher(cleanLine);
-                                if (m.find()) {
-                                    cpu.cores = m.group(1);
-                                }
-                            }
-                            // Parse: Architecture: x86_64
-                            else if (cleanLine.startsWith("Architecture:")) {
-                                cpu.arch = cleanLine.replaceFirst("Architecture:\\s*", "").trim();
-                            }
-                        }
-                    }
-                }
+            String resultStr = buildCpuSummary(sessionId);
+            if (resultStr == null) {
+                resultStr = "No CPU information found in session " + sessionId;
             }
-
-            if (nodeCpus.isEmpty()) {
-                String resultStr = "No CPU information found in session " + sessionId;
-                reportToMultiplexer(resultStr);
-                ActionResult result = new ActionResult(true, resultStr);
-                logger.exiting(CLASS_NAME, "summarizeCpu", result);
-                return result;
-            }
-
-            // Build markdown table
-            StringBuilder sb = new StringBuilder();
-            sb.append("## CPU Summary\n");
-            sb.append("| node | model | cores | arch |\n");
-            sb.append("|------|-------|-------|------|\n");
-
-            for (Map.Entry<String, CpuInfo> entry : nodeCpus.entrySet()) {
-                String nodeShort = entry.getKey().replaceFirst("^node-", "");
-                CpuInfo cpu = entry.getValue();
-                sb.append(String.format("| %s | %s | %s | %s |%n",
-                        nodeShort,
-                        cpu.model != null ? cpu.model : "-",
-                        cpu.cores != null ? cpu.cores : "-",
-                        cpu.arch != null ? cpu.arch : "-"));
-            }
-
-            String resultStr = sb.toString();
             reportToMultiplexer(resultStr);
             ActionResult result = new ActionResult(true, resultStr);
             logger.exiting(CLASS_NAME, "summarizeCpu", result);
             return result;
-
         } catch (Exception e) {
             ActionResult result = new ActionResult(false, "Query failed: " + e.getMessage());
             logger.logp(Level.WARNING, CLASS_NAME, "summarizeCpu", "Exception occurred", e);
@@ -627,89 +563,14 @@ public class SystemInfoAggregator implements CallableByActionName, ActorSystemAw
 
         try {
             long sessionId = resolveSessionId(sessionIdStr);
-
-            // Extract GPU-related log entries (lspci VGA, nvidia-smi)
-            String sql = "SELECT node_id, message FROM logs " +
-                         "WHERE session_id = ? AND message LIKE '%GPU INFO%' " +
-                         "ORDER BY node_id, timestamp";
-
-            Map<String, List<String>> nodeGpus = new LinkedHashMap<>();
-
-            try (PreparedStatement ps = connection.prepareStatement(sql)) {
-                ps.setLong(1, sessionId);
-                try (ResultSet rs = ps.executeQuery()) {
-                    while (rs.next()) {
-                        String nodeId = rs.getString("node_id");
-                        String message = rs.getString("message");
-
-                        // Parse each line in the multi-line message
-                        for (String line : message.split("\n")) {
-                            // Strip node prefix like [node-192.168.5.13]
-                            String cleanLine = line.replaceFirst("^\\[node-[^\\]]+\\]\\s*", "").trim();
-
-                            // Skip header/marker lines
-                            if (cleanLine.contains("GPU INFO") || cleanLine.isEmpty()) {
-                                continue;
-                            }
-
-                            // Pattern 1: lspci output
-                            // VGA compatible controller: NVIDIA Corporation ... [GeForce RTX 3080]
-                            // 3D controller: NVIDIA Corporation ...
-                            Pattern lspciPattern = Pattern.compile(
-                                "(?:VGA compatible controller|3D controller|Display controller):\\s*(.+?)(?:\\s*\\(rev|$)"
-                            );
-                            Matcher lspciMatcher = lspciPattern.matcher(cleanLine);
-                            if (lspciMatcher.find()) {
-                                String gpu = lspciMatcher.group(1).trim();
-                                nodeGpus.computeIfAbsent(nodeId, k -> new ArrayList<>()).add(gpu);
-                                continue;
-                            }
-
-                            // Pattern 2: nvidia-smi CSV output
-                            // NVIDIA GeForce RTX 4080, 16384 MiB, 550.54.14
-                            // NVIDIA H100, 80 GB, 550.54.14
-                            if (cleanLine.startsWith("NVIDIA") || cleanLine.contains("GeForce") ||
-                                cleanLine.contains("Quadro") || cleanLine.contains("Tesla") ||
-                                cleanLine.contains("A100") || cleanLine.contains("H100") ||
-                                cleanLine.contains("DGX")) {
-                                // Extract GPU name (first part before memory info)
-                                String gpu = cleanLine.split(",")[0].trim();
-                                if (!gpu.isEmpty() && !gpu.equals("No GPU detected via lspci")) {
-                                    nodeGpus.computeIfAbsent(nodeId, k -> new ArrayList<>()).add(gpu);
-                                }
-                            }
-                        }
-                    }
-                }
+            String resultStr = buildGpuSummary(sessionId);
+            if (resultStr == null) {
+                resultStr = "No GPU information found in session " + sessionId;
             }
-
-            if (nodeGpus.isEmpty()) {
-                String resultStr = "No GPU information found in session " + sessionId;
-                reportToMultiplexer(resultStr);
-                ActionResult result = new ActionResult(true, resultStr);
-                logger.exiting(CLASS_NAME, "summarizeGpu", result);
-                return result;
-            }
-
-            // Build markdown table
-            StringBuilder sb = new StringBuilder();
-            sb.append("## GPU Summary\n");
-            sb.append("| node | gpu |\n");
-            sb.append("|------|-----|\n");
-
-            for (Map.Entry<String, List<String>> entry : nodeGpus.entrySet()) {
-                String nodeShort = entry.getKey().replaceFirst("^node-", "");
-                for (String gpu : entry.getValue()) {
-                    sb.append(String.format("| %s | %s |%n", nodeShort, gpu));
-                }
-            }
-
-            String resultStr = sb.toString();
             reportToMultiplexer(resultStr);
             ActionResult result = new ActionResult(true, resultStr);
             logger.exiting(CLASS_NAME, "summarizeGpu", result);
             return result;
-
         } catch (Exception e) {
             ActionResult result = new ActionResult(false, "Query failed: " + e.getMessage());
             logger.logp(Level.WARNING, CLASS_NAME, "summarizeGpu", "Exception occurred", e);
@@ -733,89 +594,14 @@ public class SystemInfoAggregator implements CallableByActionName, ActorSystemAw
 
         try {
             long sessionId = resolveSessionId(sessionIdStr);
-
-            // Extract memory-related log entries (free -h output)
-            String sql = "SELECT node_id, message FROM logs " +
-                         "WHERE session_id = ? AND message LIKE '%MEMORY INFO%' " +
-                         "ORDER BY node_id, timestamp";
-
-            Map<String, MemoryInfo> nodeMemory = new LinkedHashMap<>();
-
-            try (PreparedStatement ps = connection.prepareStatement(sql)) {
-                ps.setLong(1, sessionId);
-                try (ResultSet rs = ps.executeQuery()) {
-                    while (rs.next()) {
-                        String nodeId = rs.getString("node_id");
-                        String message = rs.getString("message");
-
-                        MemoryInfo mem = nodeMemory.computeIfAbsent(nodeId, k -> new MemoryInfo());
-
-                        // Parse each line in the multi-line message
-                        for (String line : message.split("\n")) {
-                            // Strip node prefix like [node-192.168.5.13]
-                            String cleanLine = line.replaceFirst("^\\[node-[^\\]]+\\]\\s*", "").trim();
-
-                            // Parse: Mem:           31Gi       8.2Gi        20Gi
-                            // Format: Mem: total used free shared buff/cache available
-                            if (cleanLine.startsWith("Mem:")) {
-                                Pattern memPattern = Pattern.compile(
-                                    "Mem:\\s+(\\S+)\\s+(\\S+)\\s+(\\S+)(?:\\s+(\\S+))?(?:\\s+(\\S+))?(?:\\s+(\\S+))?"
-                                );
-                                Matcher m = memPattern.matcher(cleanLine);
-                                if (m.find()) {
-                                    mem.total = m.group(1);
-                                    mem.used = m.group(2);
-                                    mem.free = m.group(3);
-                                    if (m.group(6) != null) {
-                                        mem.available = m.group(6);
-                                    }
-                                }
-                            }
-                            // Parse: Swap:         8.0Gi          0B       8.0Gi
-                            else if (cleanLine.startsWith("Swap:")) {
-                                Pattern swapPattern = Pattern.compile("Swap:\\s+(\\S+)");
-                                Matcher m = swapPattern.matcher(cleanLine);
-                                if (m.find()) {
-                                    mem.swap = m.group(1);
-                                }
-                            }
-                        }
-                    }
-                }
+            String resultStr = buildMemorySummary(sessionId);
+            if (resultStr == null) {
+                resultStr = "No memory information found in session " + sessionId;
             }
-
-            if (nodeMemory.isEmpty()) {
-                String resultStr = "No memory information found in session " + sessionId;
-                reportToMultiplexer(resultStr);
-                ActionResult result = new ActionResult(true, resultStr);
-                logger.exiting(CLASS_NAME, "summarizeMemory", result);
-                return result;
-            }
-
-            // Build markdown table
-            StringBuilder sb = new StringBuilder();
-            sb.append("## Memory Summary\n");
-            sb.append("| node | total | used | free | available | swap |\n");
-            sb.append("|------|-------|------|------|-----------|------|\n");
-
-            for (Map.Entry<String, MemoryInfo> entry : nodeMemory.entrySet()) {
-                String nodeShort = entry.getKey().replaceFirst("^node-", "");
-                MemoryInfo mem = entry.getValue();
-                sb.append(String.format("| %s | %s | %s | %s | %s | %s |%n",
-                        nodeShort,
-                        mem.total != null ? mem.total : "-",
-                        mem.used != null ? mem.used : "-",
-                        mem.free != null ? mem.free : "-",
-                        mem.available != null ? mem.available : "-",
-                        mem.swap != null ? mem.swap : "-"));
-            }
-
-            String resultStr = sb.toString();
             reportToMultiplexer(resultStr);
             ActionResult result = new ActionResult(true, resultStr);
             logger.exiting(CLASS_NAME, "summarizeMemory", result);
             return result;
-
         } catch (Exception e) {
             ActionResult result = new ActionResult(false, "Query failed: " + e.getMessage());
             logger.logp(Level.WARNING, CLASS_NAME, "summarizeMemory", "Exception occurred", e);
@@ -839,94 +625,14 @@ public class SystemInfoAggregator implements CallableByActionName, ActorSystemAw
 
         try {
             long sessionId = resolveSessionId(sessionIdStr);
-
-            // Extract network-related log entries (ip addr output)
-            String sql = "SELECT node_id, message FROM logs " +
-                         "WHERE session_id = ? AND message LIKE '%NETWORK INFO%' " +
-                         "ORDER BY node_id, timestamp";
-
-            Map<String, List<NetworkInfo>> nodeNetworks = new LinkedHashMap<>();
-
-            try (PreparedStatement ps = connection.prepareStatement(sql)) {
-                ps.setLong(1, sessionId);
-                try (ResultSet rs = ps.executeQuery()) {
-                    while (rs.next()) {
-                        String nodeId = rs.getString("node_id");
-                        String message = rs.getString("message");
-
-                        List<NetworkInfo> nets = nodeNetworks.computeIfAbsent(nodeId, k -> new ArrayList<>());
-                        NetworkInfo currentNet = null;
-
-                        // Parse each line in the multi-line message
-                        for (String line : message.split("\n")) {
-                            // Strip node prefix like [node-192.168.5.13]
-                            String cleanLine = line.replaceFirst("^\\[node-[^\\]]+\\]\\s*", "").trim();
-
-                            // Parse interface line: 2: enp0s31f6: <BROADCAST,...> ... state UP
-                            Pattern ifPattern = Pattern.compile("^\\d+:\\s+(\\S+):\\s+<.*>.*state\\s+(\\S+)");
-                            Matcher ifMatcher = ifPattern.matcher(cleanLine);
-                            if (ifMatcher.find()) {
-                                currentNet = new NetworkInfo();
-                                currentNet.iface = ifMatcher.group(1);
-                                currentNet.state = ifMatcher.group(2);
-                                nets.add(currentNet);
-                                continue;
-                            }
-
-                            // Parse inet line: inet 192.168.5.13/24 brd 192.168.5.255
-                            Pattern inetPattern = Pattern.compile("inet\\s+([\\d.]+(?:/\\d+)?)");
-                            Matcher inetMatcher = inetPattern.matcher(cleanLine);
-                            if (inetMatcher.find() && currentNet != null && currentNet.ip == null) {
-                                currentNet.ip = inetMatcher.group(1);
-                            }
-
-                            // Parse MAC address: link/ether aa:bb:cc:dd:ee:ff
-                            Pattern macPattern = Pattern.compile("ether\\s+([0-9a-f:]+)");
-                            Matcher macMatcher = macPattern.matcher(cleanLine);
-                            if (macMatcher.find() && currentNet != null && currentNet.mac == null) {
-                                currentNet.mac = macMatcher.group(1);
-                            }
-                        }
-                    }
-                }
+            String resultStr = buildNetworkSummary(sessionId);
+            if (resultStr == null) {
+                resultStr = "No network information found in session " + sessionId;
             }
-
-            if (nodeNetworks.isEmpty()) {
-                String resultStr = "No network information found in session " + sessionId;
-                reportToMultiplexer(resultStr);
-                ActionResult result = new ActionResult(true, resultStr);
-                logger.exiting(CLASS_NAME, "summarizeNetwork", result);
-                return result;
-            }
-
-            // Build markdown table
-            StringBuilder sb = new StringBuilder();
-            sb.append("## Network Summary\n");
-            sb.append("| node | interface | state | ip | mac |\n");
-            sb.append("|------|-----------|-------|-----|-----|\n");
-
-            for (Map.Entry<String, List<NetworkInfo>> entry : nodeNetworks.entrySet()) {
-                String nodeShort = entry.getKey().replaceFirst("^node-", "");
-                for (NetworkInfo net : entry.getValue()) {
-                    // Skip loopback
-                    if (net.iface != null && net.iface.equals("lo")) {
-                        continue;
-                    }
-                    sb.append(String.format("| %s | %s | %s | %s | %s |%n",
-                            nodeShort,
-                            net.iface != null ? net.iface : "-",
-                            net.state != null ? net.state : "-",
-                            net.ip != null ? net.ip : "-",
-                            net.mac != null ? net.mac : "-"));
-                }
-            }
-
-            String resultStr = sb.toString();
             reportToMultiplexer(resultStr);
             ActionResult result = new ActionResult(true, resultStr);
             logger.exiting(CLASS_NAME, "summarizeNetwork", result);
             return result;
-
         } catch (Exception e) {
             ActionResult result = new ActionResult(false, "Query failed: " + e.getMessage());
             logger.logp(Level.WARNING, CLASS_NAME, "summarizeNetwork", "Exception occurred", e);
@@ -950,36 +656,35 @@ public class SystemInfoAggregator implements CallableByActionName, ActorSystemAw
 
         try {
             long sessionId = resolveSessionId(sessionIdStr);
-            String sessionIdResolved = String.valueOf(sessionId);
 
             StringBuilder sb = new StringBuilder();
             sb.append("# System Information Summary (Session #").append(sessionId).append(")\n\n");
 
-            // Collect all summaries
-            ActionResult cpuResult = summarizeCpu(sessionIdResolved);
-            if (cpuResult.isSuccess() && !cpuResult.getResult().contains("No CPU information")) {
-                sb.append(cpuResult.getResult()).append("\n");
+            // Collect all summaries using internal methods (no reporting)
+            String cpuResult = buildCpuSummary(sessionId);
+            if (cpuResult != null) {
+                sb.append(cpuResult).append("\n");
             }
 
-            ActionResult gpuResult = summarizeGpu(sessionIdResolved);
-            if (gpuResult.isSuccess() && !gpuResult.getResult().contains("No GPU information")) {
-                sb.append(gpuResult.getResult()).append("\n");
+            String gpuResult = buildGpuSummary(sessionId);
+            if (gpuResult != null) {
+                sb.append(gpuResult).append("\n");
             }
 
-            ActionResult memResult = summarizeMemory(sessionIdResolved);
-            if (memResult.isSuccess() && !memResult.getResult().contains("No memory information")) {
-                sb.append(memResult.getResult()).append("\n");
+            String memResult = buildMemorySummary(sessionId);
+            if (memResult != null) {
+                sb.append(memResult).append("\n");
             }
 
-            ActionResult diskResult = summarizeDisks(sessionIdResolved);
-            if (diskResult.isSuccess() && !diskResult.getResult().contains("No disk information")) {
+            String diskResult = buildDiskSummary(sessionId);
+            if (diskResult != null) {
                 sb.append("## Disk Summary\n");
-                sb.append(diskResult.getResult()).append("\n");
+                sb.append(diskResult).append("\n");
             }
 
-            ActionResult netResult = summarizeNetwork(sessionIdResolved);
-            if (netResult.isSuccess() && !netResult.getResult().contains("No network information")) {
-                sb.append(netResult.getResult()).append("\n");
+            String netResult = buildNetworkSummary(sessionId);
+            if (netResult != null) {
+                sb.append(netResult).append("\n");
             }
 
             String resultStr = sb.toString();
@@ -995,6 +700,290 @@ public class SystemInfoAggregator implements CallableByActionName, ActorSystemAw
             return result;
         }
     }
+
+    // ========== Internal build methods (no reporting) ==========
+
+    /**
+     * Build CPU summary table without reporting.
+     * @return markdown table or null if no data
+     */
+    private String buildCpuSummary(long sessionId) throws SQLException {
+        String sql = "SELECT node_id, message FROM logs " +
+                     "WHERE session_id = ? AND message LIKE '%CPU INFO%' " +
+                     "ORDER BY node_id, timestamp";
+
+        Map<String, CpuInfo> nodeCpus = new LinkedHashMap<>();
+
+        try (PreparedStatement ps = connection.prepareStatement(sql)) {
+            ps.setLong(1, sessionId);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    String nodeId = rs.getString("node_id");
+                    String message = rs.getString("message");
+                    CpuInfo cpu = nodeCpus.computeIfAbsent(nodeId, k -> new CpuInfo());
+                    for (String line : message.split("\n")) {
+                        String cleanLine = line.replaceFirst("^\\[node-[^\\]]+\\]\\s*", "").trim();
+                        if (cleanLine.startsWith("Model name:")) {
+                            cpu.model = cleanLine.replaceFirst("Model name:\\s*", "").trim();
+                        } else if (cleanLine.startsWith("CPU(s):")) {
+                            Matcher m = Pattern.compile("CPU\\(s\\):\\s*(\\d+)").matcher(cleanLine);
+                            if (m.find()) cpu.cores = m.group(1);
+                        } else if (cleanLine.startsWith("Architecture:")) {
+                            cpu.arch = cleanLine.replaceFirst("Architecture:\\s*", "").trim();
+                        }
+                    }
+                }
+            }
+        }
+
+        if (nodeCpus.isEmpty()) return null;
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("## CPU Summary\n");
+        sb.append("| node | model | cores | arch |\n");
+        sb.append("|------|-------|-------|------|\n");
+        for (Map.Entry<String, CpuInfo> entry : nodeCpus.entrySet()) {
+            String nodeShort = entry.getKey().replaceFirst("^node-", "");
+            CpuInfo cpu = entry.getValue();
+            sb.append(String.format("| %s | %s | %s | %s |%n",
+                    nodeShort,
+                    cpu.model != null ? cpu.model : "-",
+                    cpu.cores != null ? cpu.cores : "-",
+                    cpu.arch != null ? cpu.arch : "-"));
+        }
+        return sb.toString();
+    }
+
+    /**
+     * Build GPU summary table without reporting.
+     * @return markdown table or null if no data
+     */
+    private String buildGpuSummary(long sessionId) throws SQLException {
+        String sql = "SELECT node_id, message FROM logs " +
+                     "WHERE session_id = ? AND message LIKE '%GPU INFO%' " +
+                     "ORDER BY node_id, timestamp";
+
+        Map<String, List<String>> nodeGpus = new LinkedHashMap<>();
+
+        try (PreparedStatement ps = connection.prepareStatement(sql)) {
+            ps.setLong(1, sessionId);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    String nodeId = rs.getString("node_id");
+                    String message = rs.getString("message");
+                    for (String line : message.split("\n")) {
+                        String cleanLine = line.replaceFirst("^\\[node-[^\\]]+\\]\\s*", "").trim();
+                        if (cleanLine.contains("GPU INFO") || cleanLine.isEmpty()) continue;
+
+                        Pattern lspciPattern = Pattern.compile(
+                            "(?:VGA compatible controller|3D controller|Display controller):\\s*(.+?)(?:\\s*\\(rev|$)");
+                        Matcher m = lspciPattern.matcher(cleanLine);
+                        if (m.find()) {
+                            nodeGpus.computeIfAbsent(nodeId, k -> new ArrayList<>()).add(m.group(1).trim());
+                            continue;
+                        }
+                        if (cleanLine.startsWith("NVIDIA") || cleanLine.contains("GeForce") ||
+                            cleanLine.contains("Quadro") || cleanLine.contains("Tesla") ||
+                            cleanLine.contains("A100") || cleanLine.contains("H100") ||
+                            cleanLine.contains("DGX")) {
+                            String gpu = cleanLine.split(",")[0].trim();
+                            if (!gpu.isEmpty() && !gpu.equals("No GPU detected via lspci")) {
+                                nodeGpus.computeIfAbsent(nodeId, k -> new ArrayList<>()).add(gpu);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (nodeGpus.isEmpty()) return null;
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("## GPU Summary\n");
+        sb.append("| node | gpu |\n");
+        sb.append("|------|-----|\n");
+        for (Map.Entry<String, List<String>> entry : nodeGpus.entrySet()) {
+            String nodeShort = entry.getKey().replaceFirst("^node-", "");
+            for (String gpu : entry.getValue()) {
+                sb.append(String.format("| %s | %s |%n", nodeShort, gpu));
+            }
+        }
+        return sb.toString();
+    }
+
+    /**
+     * Build Memory summary table without reporting.
+     * @return markdown table or null if no data
+     */
+    private String buildMemorySummary(long sessionId) throws SQLException {
+        String sql = "SELECT node_id, message FROM logs " +
+                     "WHERE session_id = ? AND message LIKE '%MEMORY INFO%' " +
+                     "ORDER BY node_id, timestamp";
+
+        Map<String, MemoryInfo> nodeMemory = new LinkedHashMap<>();
+
+        try (PreparedStatement ps = connection.prepareStatement(sql)) {
+            ps.setLong(1, sessionId);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    String nodeId = rs.getString("node_id");
+                    String message = rs.getString("message");
+                    MemoryInfo mem = nodeMemory.computeIfAbsent(nodeId, k -> new MemoryInfo());
+                    for (String line : message.split("\n")) {
+                        String cleanLine = line.replaceFirst("^\\[node-[^\\]]+\\]\\s*", "").trim();
+                        if (cleanLine.startsWith("Mem:")) {
+                            Pattern memPattern = Pattern.compile(
+                                "Mem:\\s+(\\S+)\\s+(\\S+)\\s+(\\S+)(?:\\s+(\\S+))?(?:\\s+(\\S+))?(?:\\s+(\\S+))?");
+                            Matcher m = memPattern.matcher(cleanLine);
+                            if (m.find()) {
+                                mem.total = m.group(1);
+                                mem.used = m.group(2);
+                                mem.free = m.group(3);
+                                if (m.group(6) != null) mem.available = m.group(6);
+                            }
+                        } else if (cleanLine.startsWith("Swap:")) {
+                            Pattern swapPattern = Pattern.compile("Swap:\\s+(\\S+)");
+                            Matcher m = swapPattern.matcher(cleanLine);
+                            if (m.find()) mem.swap = m.group(1);
+                        }
+                    }
+                }
+            }
+        }
+
+        if (nodeMemory.isEmpty()) return null;
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("## Memory Summary\n");
+        sb.append("| node | total | used | free | available | swap |\n");
+        sb.append("|------|-------|------|------|-----------|------|\n");
+        for (Map.Entry<String, MemoryInfo> entry : nodeMemory.entrySet()) {
+            String nodeShort = entry.getKey().replaceFirst("^node-", "");
+            MemoryInfo mem = entry.getValue();
+            sb.append(String.format("| %s | %s | %s | %s | %s | %s |%n",
+                    nodeShort,
+                    mem.total != null ? mem.total : "-",
+                    mem.used != null ? mem.used : "-",
+                    mem.free != null ? mem.free : "-",
+                    mem.available != null ? mem.available : "-",
+                    mem.swap != null ? mem.swap : "-"));
+        }
+        return sb.toString();
+    }
+
+    /**
+     * Build Disk summary table without reporting.
+     * @return markdown table or null if no data
+     */
+    private String buildDiskSummary(long sessionId) throws SQLException {
+        String sql = "SELECT node_id, message FROM logs " +
+                     "WHERE session_id = ? AND message LIKE '%DISK INFO%' " +
+                     "ORDER BY node_id, timestamp";
+
+        Map<String, List<DiskInfo>> nodeDisks = new LinkedHashMap<>();
+
+        try (PreparedStatement ps = connection.prepareStatement(sql)) {
+            ps.setLong(1, sessionId);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    String nodeId = rs.getString("node_id");
+                    String message = rs.getString("message");
+                    for (String line : message.split("\n")) {
+                        String cleanLine = line.replaceFirst("^\\[node-[^\\]]+\\]\\s*", "").trim();
+                        Pattern diskPattern = Pattern.compile(
+                            "(sd[a-z]+|nvme\\d+n\\d+)\\s+([\\d.]+[GMTP])\\s+disk\\s+(.+)$");
+                        Matcher m = diskPattern.matcher(cleanLine);
+                        if (m.find()) {
+                            nodeDisks.computeIfAbsent(nodeId, k -> new ArrayList<>())
+                                .add(new DiskInfo(m.group(1), m.group(2), m.group(3).trim()));
+                        }
+                    }
+                }
+            }
+        }
+
+        if (nodeDisks.isEmpty()) return null;
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("| node | disk | model | size |\n");
+        sb.append("|------|------|-------|------|\n");
+        for (Map.Entry<String, List<DiskInfo>> entry : nodeDisks.entrySet()) {
+            String nodeShort = entry.getKey().replaceFirst("^node-", "");
+            for (DiskInfo disk : entry.getValue()) {
+                sb.append(String.format("| %s | %s | %s | %s |%n",
+                        nodeShort, disk.device, disk.model, disk.size));
+            }
+        }
+        return sb.toString();
+    }
+
+    /**
+     * Build Network summary table without reporting.
+     * @return markdown table or null if no data
+     */
+    private String buildNetworkSummary(long sessionId) throws SQLException {
+        String sql = "SELECT node_id, message FROM logs " +
+                     "WHERE session_id = ? AND message LIKE '%NETWORK INFO%' " +
+                     "ORDER BY node_id, timestamp";
+
+        Map<String, List<NetworkInfo>> nodeNetworks = new LinkedHashMap<>();
+
+        try (PreparedStatement ps = connection.prepareStatement(sql)) {
+            ps.setLong(1, sessionId);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    String nodeId = rs.getString("node_id");
+                    String message = rs.getString("message");
+                    List<NetworkInfo> nets = nodeNetworks.computeIfAbsent(nodeId, k -> new ArrayList<>());
+                    NetworkInfo currentNet = null;
+                    for (String line : message.split("\n")) {
+                        String cleanLine = line.replaceFirst("^\\[node-[^\\]]+\\]\\s*", "").trim();
+                        Pattern ifPattern = Pattern.compile("^\\d+:\\s+(\\S+):\\s+<.*>.*state\\s+(\\S+)");
+                        Matcher ifMatcher = ifPattern.matcher(cleanLine);
+                        if (ifMatcher.find()) {
+                            currentNet = new NetworkInfo();
+                            currentNet.iface = ifMatcher.group(1);
+                            currentNet.state = ifMatcher.group(2);
+                            nets.add(currentNet);
+                            continue;
+                        }
+                        Pattern inetPattern = Pattern.compile("inet\\s+([\\d.]+(?:/\\d+)?)");
+                        Matcher inetMatcher = inetPattern.matcher(cleanLine);
+                        if (inetMatcher.find() && currentNet != null && currentNet.ip == null) {
+                            currentNet.ip = inetMatcher.group(1);
+                        }
+                        Pattern macPattern = Pattern.compile("ether\\s+([0-9a-f:]+)");
+                        Matcher macMatcher = macPattern.matcher(cleanLine);
+                        if (macMatcher.find() && currentNet != null && currentNet.mac == null) {
+                            currentNet.mac = macMatcher.group(1);
+                        }
+                    }
+                }
+            }
+        }
+
+        if (nodeNetworks.isEmpty()) return null;
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("## Network Summary\n");
+        sb.append("| node | interface | state | ip | mac |\n");
+        sb.append("|------|-----------|-------|-----|-----|\n");
+        for (Map.Entry<String, List<NetworkInfo>> entry : nodeNetworks.entrySet()) {
+            String nodeShort = entry.getKey().replaceFirst("^node-", "");
+            for (NetworkInfo net : entry.getValue()) {
+                if (net.iface != null && net.iface.equals("lo")) continue;
+                sb.append(String.format("| %s | %s | %s | %s | %s |%n",
+                        nodeShort,
+                        net.iface != null ? net.iface : "-",
+                        net.state != null ? net.state : "-",
+                        net.ip != null ? net.ip : "-",
+                        net.mac != null ? net.mac : "-"));
+            }
+        }
+        return sb.toString();
+    }
+
+    // ========== End of internal build methods ==========
 
     /**
      * Resolve session ID from argument or auto-retrieve from nodeGroup.
