@@ -41,6 +41,11 @@ import java.util.regex.*;
  * <ul>
  *   <li>connect - Connect to H2 database. Args: dbPath</li>
  *   <li>summarize-disks - Summarize disk info from logs. Args: sessionId</li>
+ *   <li>summarize-cpu - Summarize CPU info from logs. Args: sessionId</li>
+ *   <li>summarize-gpu - Summarize GPU info from logs. Args: sessionId</li>
+ *   <li>summarize-memory - Summarize memory info from logs. Args: sessionId</li>
+ *   <li>summarize-network - Summarize network info from logs. Args: sessionId</li>
+ *   <li>summarize-all - Summarize all system info. Args: sessionId</li>
  *   <li>list-sessions - List available sessions</li>
  *   <li>node-status - Show node status summary. Args: sessionId</li>
  * </ul>
@@ -71,6 +76,11 @@ public class SystemInfoAggregator implements CallableByActionName, ActorSystemAw
             ActionResult result = switch (actionName) {
                 case "connect" -> connect(args);
                 case "summarize-disks" -> summarizeDisks(args);
+                case "summarize-cpu" -> summarizeCpu(args);
+                case "summarize-gpu" -> summarizeGpu(args);
+                case "summarize-memory" -> summarizeMemory(args);
+                case "summarize-network" -> summarizeNetwork(args);
+                case "summarize-all" -> summarizeAll(args);
                 case "list-sessions" -> listSessions();
                 case "node-status" -> nodeStatus(args);
                 case "disconnect" -> disconnect();
@@ -502,7 +512,505 @@ public class SystemInfoAggregator implements CallableByActionName, ActorSystemAw
     }
 
     /**
+     * Summarize CPU information from logs.
+     *
+     * @param sessionIdStr session ID to analyze, or empty for auto-retrieval
+     */
+    private ActionResult summarizeCpu(String sessionIdStr) {
+        logger.entering(CLASS_NAME, "summarizeCpu", sessionIdStr);
+        if (connection == null) {
+            ActionResult result = new ActionResult(false, "Not connected. Use 'connect' first.");
+            logger.exiting(CLASS_NAME, "summarizeCpu", result);
+            return result;
+        }
+
+        try {
+            long sessionId = resolveSessionId(sessionIdStr);
+
+            // Extract CPU-related log entries (lscpu output)
+            String sql = "SELECT node_id, message FROM logs " +
+                         "WHERE session_id = ? AND (message LIKE '%Model name%' OR message LIKE '%CPU(s):%' " +
+                         "OR message LIKE '%Architecture%' OR message LIKE '%Thread(s) per core%') " +
+                         "ORDER BY node_id, timestamp";
+
+            Map<String, CpuInfo> nodeCpus = new LinkedHashMap<>();
+
+            try (PreparedStatement ps = connection.prepareStatement(sql)) {
+                ps.setLong(1, sessionId);
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        String nodeId = rs.getString("node_id");
+                        String message = rs.getString("message");
+
+                        CpuInfo cpu = nodeCpus.computeIfAbsent(nodeId, k -> new CpuInfo());
+
+                        // Parse: Model name: Intel(R) Core(TM) i7-10700 CPU @ 2.90GHz
+                        if (message.contains("Model name:")) {
+                            cpu.model = message.replaceFirst(".*Model name:\\s*", "").trim();
+                        }
+                        // Parse: CPU(s): 16
+                        else if (message.matches(".*CPU\\(s\\):\\s*\\d+.*")) {
+                            Matcher m = Pattern.compile("CPU\\(s\\):\\s*(\\d+)").matcher(message);
+                            if (m.find()) {
+                                cpu.cores = m.group(1);
+                            }
+                        }
+                        // Parse: Architecture: x86_64
+                        else if (message.contains("Architecture:")) {
+                            cpu.arch = message.replaceFirst(".*Architecture:\\s*", "").trim();
+                        }
+                    }
+                }
+            }
+
+            if (nodeCpus.isEmpty()) {
+                String resultStr = "No CPU information found in session " + sessionId;
+                reportToMultiplexer(resultStr);
+                ActionResult result = new ActionResult(true, resultStr);
+                logger.exiting(CLASS_NAME, "summarizeCpu", result);
+                return result;
+            }
+
+            // Build markdown table
+            StringBuilder sb = new StringBuilder();
+            sb.append("## CPU Summary\n");
+            sb.append("| node | model | cores | arch |\n");
+            sb.append("|------|-------|-------|------|\n");
+
+            for (Map.Entry<String, CpuInfo> entry : nodeCpus.entrySet()) {
+                String nodeShort = entry.getKey().replaceFirst("^node-", "");
+                CpuInfo cpu = entry.getValue();
+                sb.append(String.format("| %s | %s | %s | %s |%n",
+                        nodeShort,
+                        cpu.model != null ? cpu.model : "-",
+                        cpu.cores != null ? cpu.cores : "-",
+                        cpu.arch != null ? cpu.arch : "-"));
+            }
+
+            String resultStr = sb.toString();
+            reportToMultiplexer(resultStr);
+            ActionResult result = new ActionResult(true, resultStr);
+            logger.exiting(CLASS_NAME, "summarizeCpu", result);
+            return result;
+
+        } catch (Exception e) {
+            ActionResult result = new ActionResult(false, "Query failed: " + e.getMessage());
+            logger.logp(Level.WARNING, CLASS_NAME, "summarizeCpu", "Exception occurred", e);
+            logger.exiting(CLASS_NAME, "summarizeCpu", result);
+            return result;
+        }
+    }
+
+    /**
+     * Summarize GPU information from logs.
+     *
+     * @param sessionIdStr session ID to analyze, or empty for auto-retrieval
+     */
+    private ActionResult summarizeGpu(String sessionIdStr) {
+        logger.entering(CLASS_NAME, "summarizeGpu", sessionIdStr);
+        if (connection == null) {
+            ActionResult result = new ActionResult(false, "Not connected. Use 'connect' first.");
+            logger.exiting(CLASS_NAME, "summarizeGpu", result);
+            return result;
+        }
+
+        try {
+            long sessionId = resolveSessionId(sessionIdStr);
+
+            // Extract GPU-related log entries (lspci VGA, nvidia-smi)
+            String sql = "SELECT node_id, message FROM logs " +
+                         "WHERE session_id = ? AND (message LIKE '%VGA%' OR message LIKE '%3D controller%' " +
+                         "OR message LIKE '%NVIDIA%' OR message LIKE '%GeForce%' OR message LIKE '%Radeon%') " +
+                         "ORDER BY node_id, timestamp";
+
+            Map<String, List<String>> nodeGpus = new LinkedHashMap<>();
+
+            try (PreparedStatement ps = connection.prepareStatement(sql)) {
+                ps.setLong(1, sessionId);
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        String nodeId = rs.getString("node_id");
+                        String message = rs.getString("message");
+
+                        // Parse GPU name from lspci output
+                        // Pattern: VGA compatible controller: NVIDIA Corporation ... [GeForce RTX 3080]
+                        //          3D controller: NVIDIA Corporation ...
+                        Pattern gpuPattern = Pattern.compile(
+                            "(?:VGA compatible controller|3D controller):\\s*(.+?)(?:\\s*\\(rev|$)"
+                        );
+                        Matcher m = gpuPattern.matcher(message);
+                        if (m.find()) {
+                            String gpu = m.group(1).trim();
+                            nodeGpus.computeIfAbsent(nodeId, k -> new ArrayList<>()).add(gpu);
+                        }
+                    }
+                }
+            }
+
+            if (nodeGpus.isEmpty()) {
+                String resultStr = "No GPU information found in session " + sessionId;
+                reportToMultiplexer(resultStr);
+                ActionResult result = new ActionResult(true, resultStr);
+                logger.exiting(CLASS_NAME, "summarizeGpu", result);
+                return result;
+            }
+
+            // Build markdown table
+            StringBuilder sb = new StringBuilder();
+            sb.append("## GPU Summary\n");
+            sb.append("| node | gpu |\n");
+            sb.append("|------|-----|\n");
+
+            for (Map.Entry<String, List<String>> entry : nodeGpus.entrySet()) {
+                String nodeShort = entry.getKey().replaceFirst("^node-", "");
+                for (String gpu : entry.getValue()) {
+                    sb.append(String.format("| %s | %s |%n", nodeShort, gpu));
+                }
+            }
+
+            String resultStr = sb.toString();
+            reportToMultiplexer(resultStr);
+            ActionResult result = new ActionResult(true, resultStr);
+            logger.exiting(CLASS_NAME, "summarizeGpu", result);
+            return result;
+
+        } catch (Exception e) {
+            ActionResult result = new ActionResult(false, "Query failed: " + e.getMessage());
+            logger.logp(Level.WARNING, CLASS_NAME, "summarizeGpu", "Exception occurred", e);
+            logger.exiting(CLASS_NAME, "summarizeGpu", result);
+            return result;
+        }
+    }
+
+    /**
+     * Summarize memory information from logs.
+     *
+     * @param sessionIdStr session ID to analyze, or empty for auto-retrieval
+     */
+    private ActionResult summarizeMemory(String sessionIdStr) {
+        logger.entering(CLASS_NAME, "summarizeMemory", sessionIdStr);
+        if (connection == null) {
+            ActionResult result = new ActionResult(false, "Not connected. Use 'connect' first.");
+            logger.exiting(CLASS_NAME, "summarizeMemory", result);
+            return result;
+        }
+
+        try {
+            long sessionId = resolveSessionId(sessionIdStr);
+
+            // Extract memory-related log entries (free -h, /proc/meminfo)
+            String sql = "SELECT node_id, message FROM logs " +
+                         "WHERE session_id = ? AND (message LIKE '%Mem:%' OR message LIKE '%MemTotal%' " +
+                         "OR message LIKE '%MemAvailable%' OR message LIKE '%Swap:%') " +
+                         "ORDER BY node_id, timestamp";
+
+            Map<String, MemoryInfo> nodeMemory = new LinkedHashMap<>();
+
+            try (PreparedStatement ps = connection.prepareStatement(sql)) {
+                ps.setLong(1, sessionId);
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        String nodeId = rs.getString("node_id");
+                        String message = rs.getString("message");
+
+                        MemoryInfo mem = nodeMemory.computeIfAbsent(nodeId, k -> new MemoryInfo());
+
+                        // Parse: Mem:           31Gi       8.2Gi        20Gi
+                        // Format: Mem: total used free shared buff/cache available
+                        if (message.contains("Mem:") && !message.contains("MemTotal")) {
+                            Pattern memPattern = Pattern.compile(
+                                "Mem:\\s+(\\S+)\\s+(\\S+)\\s+(\\S+)(?:\\s+(\\S+))?(?:\\s+(\\S+))?(?:\\s+(\\S+))?"
+                            );
+                            Matcher m = memPattern.matcher(message);
+                            if (m.find()) {
+                                mem.total = m.group(1);
+                                mem.used = m.group(2);
+                                mem.free = m.group(3);
+                                if (m.group(6) != null) {
+                                    mem.available = m.group(6);
+                                }
+                            }
+                        }
+                        // Parse: Swap:         8.0Gi          0B       8.0Gi
+                        else if (message.contains("Swap:")) {
+                            Pattern swapPattern = Pattern.compile("Swap:\\s+(\\S+)");
+                            Matcher m = swapPattern.matcher(message);
+                            if (m.find()) {
+                                mem.swap = m.group(1);
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (nodeMemory.isEmpty()) {
+                String resultStr = "No memory information found in session " + sessionId;
+                reportToMultiplexer(resultStr);
+                ActionResult result = new ActionResult(true, resultStr);
+                logger.exiting(CLASS_NAME, "summarizeMemory", result);
+                return result;
+            }
+
+            // Build markdown table
+            StringBuilder sb = new StringBuilder();
+            sb.append("## Memory Summary\n");
+            sb.append("| node | total | used | free | available | swap |\n");
+            sb.append("|------|-------|------|------|-----------|------|\n");
+
+            for (Map.Entry<String, MemoryInfo> entry : nodeMemory.entrySet()) {
+                String nodeShort = entry.getKey().replaceFirst("^node-", "");
+                MemoryInfo mem = entry.getValue();
+                sb.append(String.format("| %s | %s | %s | %s | %s | %s |%n",
+                        nodeShort,
+                        mem.total != null ? mem.total : "-",
+                        mem.used != null ? mem.used : "-",
+                        mem.free != null ? mem.free : "-",
+                        mem.available != null ? mem.available : "-",
+                        mem.swap != null ? mem.swap : "-"));
+            }
+
+            String resultStr = sb.toString();
+            reportToMultiplexer(resultStr);
+            ActionResult result = new ActionResult(true, resultStr);
+            logger.exiting(CLASS_NAME, "summarizeMemory", result);
+            return result;
+
+        } catch (Exception e) {
+            ActionResult result = new ActionResult(false, "Query failed: " + e.getMessage());
+            logger.logp(Level.WARNING, CLASS_NAME, "summarizeMemory", "Exception occurred", e);
+            logger.exiting(CLASS_NAME, "summarizeMemory", result);
+            return result;
+        }
+    }
+
+    /**
+     * Summarize network information from logs.
+     *
+     * @param sessionIdStr session ID to analyze, or empty for auto-retrieval
+     */
+    private ActionResult summarizeNetwork(String sessionIdStr) {
+        logger.entering(CLASS_NAME, "summarizeNetwork", sessionIdStr);
+        if (connection == null) {
+            ActionResult result = new ActionResult(false, "Not connected. Use 'connect' first.");
+            logger.exiting(CLASS_NAME, "summarizeNetwork", result);
+            return result;
+        }
+
+        try {
+            long sessionId = resolveSessionId(sessionIdStr);
+
+            // Extract network-related log entries (ip addr output)
+            String sql = "SELECT node_id, message FROM logs " +
+                         "WHERE session_id = ? AND (message LIKE '%inet %' OR message LIKE '%ether %' " +
+                         "OR message LIKE '%: <%' OR message LIKE '%state UP%' OR message LIKE '%state DOWN%') " +
+                         "ORDER BY node_id, timestamp";
+
+            Map<String, List<NetworkInfo>> nodeNetworks = new LinkedHashMap<>();
+            Map<String, String> currentInterface = new HashMap<>();
+
+            try (PreparedStatement ps = connection.prepareStatement(sql)) {
+                ps.setLong(1, sessionId);
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        String nodeId = rs.getString("node_id");
+                        String message = rs.getString("message");
+
+                        // Parse interface line: 2: enp0s31f6: <BROADCAST,...> ... state UP
+                        Pattern ifPattern = Pattern.compile("^\\d+:\\s+(\\S+):\\s+<.*>.*state\\s+(\\S+)");
+                        Matcher ifMatcher = ifPattern.matcher(message);
+                        if (ifMatcher.find()) {
+                            String ifName = ifMatcher.group(1);
+                            String state = ifMatcher.group(2);
+                            currentInterface.put(nodeId, ifName);
+                            NetworkInfo net = new NetworkInfo();
+                            net.iface = ifName;
+                            net.state = state;
+                            nodeNetworks.computeIfAbsent(nodeId, k -> new ArrayList<>()).add(net);
+                            continue;
+                        }
+
+                        // Parse inet line: inet 192.168.5.13/24 brd 192.168.5.255
+                        Pattern inetPattern = Pattern.compile("inet\\s+([\\d.]+/\\d+)");
+                        Matcher inetMatcher = inetPattern.matcher(message);
+                        if (inetMatcher.find()) {
+                            String ip = inetMatcher.group(1);
+                            List<NetworkInfo> nets = nodeNetworks.get(nodeId);
+                            if (nets != null && !nets.isEmpty()) {
+                                NetworkInfo lastNet = nets.get(nets.size() - 1);
+                                if (lastNet.ip == null) {
+                                    lastNet.ip = ip;
+                                }
+                            }
+                        }
+
+                        // Parse MAC address: link/ether aa:bb:cc:dd:ee:ff
+                        Pattern macPattern = Pattern.compile("ether\\s+([0-9a-f:]+)");
+                        Matcher macMatcher = macPattern.matcher(message);
+                        if (macMatcher.find()) {
+                            String mac = macMatcher.group(1);
+                            List<NetworkInfo> nets = nodeNetworks.get(nodeId);
+                            if (nets != null && !nets.isEmpty()) {
+                                NetworkInfo lastNet = nets.get(nets.size() - 1);
+                                if (lastNet.mac == null) {
+                                    lastNet.mac = mac;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (nodeNetworks.isEmpty()) {
+                String resultStr = "No network information found in session " + sessionId;
+                reportToMultiplexer(resultStr);
+                ActionResult result = new ActionResult(true, resultStr);
+                logger.exiting(CLASS_NAME, "summarizeNetwork", result);
+                return result;
+            }
+
+            // Build markdown table
+            StringBuilder sb = new StringBuilder();
+            sb.append("## Network Summary\n");
+            sb.append("| node | interface | state | ip | mac |\n");
+            sb.append("|------|-----------|-------|-----|-----|\n");
+
+            for (Map.Entry<String, List<NetworkInfo>> entry : nodeNetworks.entrySet()) {
+                String nodeShort = entry.getKey().replaceFirst("^node-", "");
+                for (NetworkInfo net : entry.getValue()) {
+                    // Skip loopback
+                    if (net.iface != null && net.iface.equals("lo")) {
+                        continue;
+                    }
+                    sb.append(String.format("| %s | %s | %s | %s | %s |%n",
+                            nodeShort,
+                            net.iface != null ? net.iface : "-",
+                            net.state != null ? net.state : "-",
+                            net.ip != null ? net.ip : "-",
+                            net.mac != null ? net.mac : "-"));
+                }
+            }
+
+            String resultStr = sb.toString();
+            reportToMultiplexer(resultStr);
+            ActionResult result = new ActionResult(true, resultStr);
+            logger.exiting(CLASS_NAME, "summarizeNetwork", result);
+            return result;
+
+        } catch (Exception e) {
+            ActionResult result = new ActionResult(false, "Query failed: " + e.getMessage());
+            logger.logp(Level.WARNING, CLASS_NAME, "summarizeNetwork", "Exception occurred", e);
+            logger.exiting(CLASS_NAME, "summarizeNetwork", result);
+            return result;
+        }
+    }
+
+    /**
+     * Summarize all system information from logs.
+     *
+     * @param sessionIdStr session ID to analyze, or empty for auto-retrieval
+     */
+    private ActionResult summarizeAll(String sessionIdStr) {
+        logger.entering(CLASS_NAME, "summarizeAll", sessionIdStr);
+        if (connection == null) {
+            ActionResult result = new ActionResult(false, "Not connected. Use 'connect' first.");
+            logger.exiting(CLASS_NAME, "summarizeAll", result);
+            return result;
+        }
+
+        try {
+            long sessionId = resolveSessionId(sessionIdStr);
+            String sessionIdResolved = String.valueOf(sessionId);
+
+            StringBuilder sb = new StringBuilder();
+            sb.append("# System Information Summary (Session #").append(sessionId).append(")\n\n");
+
+            // Collect all summaries
+            ActionResult cpuResult = summarizeCpu(sessionIdResolved);
+            if (cpuResult.isSuccess() && !cpuResult.getResult().contains("No CPU information")) {
+                sb.append(cpuResult.getResult()).append("\n");
+            }
+
+            ActionResult gpuResult = summarizeGpu(sessionIdResolved);
+            if (gpuResult.isSuccess() && !gpuResult.getResult().contains("No GPU information")) {
+                sb.append(gpuResult.getResult()).append("\n");
+            }
+
+            ActionResult memResult = summarizeMemory(sessionIdResolved);
+            if (memResult.isSuccess() && !memResult.getResult().contains("No memory information")) {
+                sb.append(memResult.getResult()).append("\n");
+            }
+
+            ActionResult diskResult = summarizeDisks(sessionIdResolved);
+            if (diskResult.isSuccess() && !diskResult.getResult().contains("No disk information")) {
+                sb.append("## Disk Summary\n");
+                sb.append(diskResult.getResult()).append("\n");
+            }
+
+            ActionResult netResult = summarizeNetwork(sessionIdResolved);
+            if (netResult.isSuccess() && !netResult.getResult().contains("No network information")) {
+                sb.append(netResult.getResult()).append("\n");
+            }
+
+            String resultStr = sb.toString();
+            reportToMultiplexer(resultStr);
+            ActionResult result = new ActionResult(true, resultStr);
+            logger.exiting(CLASS_NAME, "summarizeAll", result);
+            return result;
+
+        } catch (Exception e) {
+            ActionResult result = new ActionResult(false, "Summarize failed: " + e.getMessage());
+            logger.logp(Level.WARNING, CLASS_NAME, "summarizeAll", "Exception occurred", e);
+            logger.exiting(CLASS_NAME, "summarizeAll", result);
+            return result;
+        }
+    }
+
+    /**
+     * Resolve session ID from argument or auto-retrieve from nodeGroup.
+     */
+    private long resolveSessionId(String sessionIdStr) throws NumberFormatException {
+        if (sessionIdStr == null || sessionIdStr.trim().isEmpty() || sessionIdStr.equals("[]")) {
+            String autoSessionId = getSessionIdFromNodeGroup();
+            if (autoSessionId == null) {
+                throw new NumberFormatException("Session ID not specified and could not retrieve from nodeGroup");
+            }
+            return Long.parseLong(autoSessionId);
+        }
+        return Long.parseLong(sessionIdStr.trim());
+    }
+
+    /**
      * Disk information holder.
      */
     private record DiskInfo(String device, String size, String model) {}
+
+    /**
+     * CPU information holder.
+     */
+    private static class CpuInfo {
+        String model;
+        String cores;
+        String arch;
+    }
+
+    /**
+     * Memory information holder.
+     */
+    private static class MemoryInfo {
+        String total;
+        String used;
+        String free;
+        String available;
+        String swap;
+    }
+
+    /**
+     * Network information holder.
+     */
+    private static class NetworkInfo {
+        String iface;
+        String state;
+        String ip;
+        String mac;
+    }
 }
