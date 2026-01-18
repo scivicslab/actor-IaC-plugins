@@ -647,16 +647,36 @@ public class SystemInfoAggregator implements CallableByActionName, ActorSystemAw
                             // Strip node prefix like [node-192.168.5.13]
                             String cleanLine = line.replaceFirst("^\\[node-[^\\]]+\\]\\s*", "").trim();
 
-                            // Parse GPU name from lspci output
-                            // Pattern: VGA compatible controller: NVIDIA Corporation ... [GeForce RTX 3080]
-                            //          3D controller: NVIDIA Corporation ...
-                            Pattern gpuPattern = Pattern.compile(
-                                "(?:VGA compatible controller|3D controller):\\s*(.+?)(?:\\s*\\(rev|$)"
+                            // Skip header/marker lines
+                            if (cleanLine.contains("GPU INFO") || cleanLine.isEmpty()) {
+                                continue;
+                            }
+
+                            // Pattern 1: lspci output
+                            // VGA compatible controller: NVIDIA Corporation ... [GeForce RTX 3080]
+                            // 3D controller: NVIDIA Corporation ...
+                            Pattern lspciPattern = Pattern.compile(
+                                "(?:VGA compatible controller|3D controller|Display controller):\\s*(.+?)(?:\\s*\\(rev|$)"
                             );
-                            Matcher m = gpuPattern.matcher(cleanLine);
-                            if (m.find()) {
-                                String gpu = m.group(1).trim();
+                            Matcher lspciMatcher = lspciPattern.matcher(cleanLine);
+                            if (lspciMatcher.find()) {
+                                String gpu = lspciMatcher.group(1).trim();
                                 nodeGpus.computeIfAbsent(nodeId, k -> new ArrayList<>()).add(gpu);
+                                continue;
+                            }
+
+                            // Pattern 2: nvidia-smi CSV output
+                            // NVIDIA GeForce RTX 4080, 16384 MiB, 550.54.14
+                            // NVIDIA H100, 80 GB, 550.54.14
+                            if (cleanLine.startsWith("NVIDIA") || cleanLine.contains("GeForce") ||
+                                cleanLine.contains("Quadro") || cleanLine.contains("Tesla") ||
+                                cleanLine.contains("A100") || cleanLine.contains("H100") ||
+                                cleanLine.contains("DGX")) {
+                                // Extract GPU name (first part before memory info)
+                                String gpu = cleanLine.split(",")[0].trim();
+                                if (!gpu.isEmpty() && !gpu.equals("No GPU detected via lspci")) {
+                                    nodeGpus.computeIfAbsent(nodeId, k -> new ArrayList<>()).add(gpu);
+                                }
                             }
                         }
                     }
