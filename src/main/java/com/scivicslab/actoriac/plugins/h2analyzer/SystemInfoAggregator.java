@@ -288,7 +288,7 @@ public class SystemInfoAggregator implements CallableByActionName, ActorSystemAw
 
             // Extract disk-related log entries
             String sql = "SELECT node_id, message FROM logs " +
-                         "WHERE session_id = ? AND message LIKE '%disk%' " +
+                         "WHERE session_id = ? AND message LIKE '%DISK INFO%' " +
                          "ORDER BY node_id, timestamp";
 
             Map<String, List<DiskInfo>> nodeDisks = new LinkedHashMap<>();
@@ -300,16 +300,22 @@ public class SystemInfoAggregator implements CallableByActionName, ActorSystemAw
                         String nodeId = rs.getString("node_id");
                         String message = rs.getString("message");
 
-                        // Parse disk info from message
-                        // Pattern: sda 1.9T disk TS2TSSD230S
-                        //          nvme0n1 931.5G disk CSSD-M2B1TPG3NF2
-                        Pattern diskPattern = Pattern.compile(
-                            "(sd[a-z]|nvme\\d+n\\d+)\\s+([\\d.]+[GMTP])\\s+disk\\s+(.+)$"
-                        );
-                        Matcher m = diskPattern.matcher(message);
-                        if (m.find()) {
-                            DiskInfo disk = new DiskInfo(m.group(1), m.group(2), m.group(3).trim());
-                            nodeDisks.computeIfAbsent(nodeId, k -> new ArrayList<>()).add(disk);
+                        // Parse each line in the multi-line message
+                        for (String line : message.split("\n")) {
+                            // Strip node prefix like [node-192.168.5.13]
+                            String cleanLine = line.replaceFirst("^\\[node-[^\\]]+\\]\\s*", "").trim();
+
+                            // Parse disk info from lsblk output
+                            // Pattern: sda 1.9T disk TS2TSSD230S
+                            //          nvme0n1 931.5G disk CSSD-M2B1TPG3NF2
+                            Pattern diskPattern = Pattern.compile(
+                                "(sd[a-z]+|nvme\\d+n\\d+)\\s+([\\d.]+[GMTP])\\s+disk\\s+(.+)$"
+                            );
+                            Matcher m = diskPattern.matcher(cleanLine);
+                            if (m.find()) {
+                                DiskInfo disk = new DiskInfo(m.group(1), m.group(2), m.group(3).trim());
+                                nodeDisks.computeIfAbsent(nodeId, k -> new ArrayList<>()).add(disk);
+                            }
                         }
                     }
                 }
@@ -529,8 +535,7 @@ public class SystemInfoAggregator implements CallableByActionName, ActorSystemAw
 
             // Extract CPU-related log entries (lscpu output)
             String sql = "SELECT node_id, message FROM logs " +
-                         "WHERE session_id = ? AND (message LIKE '%Model name%' OR message LIKE '%CPU(s):%' " +
-                         "OR message LIKE '%Architecture%' OR message LIKE '%Thread(s) per core%') " +
+                         "WHERE session_id = ? AND message LIKE '%CPU INFO%' " +
                          "ORDER BY node_id, timestamp";
 
             Map<String, CpuInfo> nodeCpus = new LinkedHashMap<>();
@@ -544,20 +549,26 @@ public class SystemInfoAggregator implements CallableByActionName, ActorSystemAw
 
                         CpuInfo cpu = nodeCpus.computeIfAbsent(nodeId, k -> new CpuInfo());
 
-                        // Parse: Model name: Intel(R) Core(TM) i7-10700 CPU @ 2.90GHz
-                        if (message.contains("Model name:")) {
-                            cpu.model = message.replaceFirst(".*Model name:\\s*", "").trim();
-                        }
-                        // Parse: CPU(s): 16
-                        else if (message.matches(".*CPU\\(s\\):\\s*\\d+.*")) {
-                            Matcher m = Pattern.compile("CPU\\(s\\):\\s*(\\d+)").matcher(message);
-                            if (m.find()) {
-                                cpu.cores = m.group(1);
+                        // Parse each line in the multi-line message
+                        for (String line : message.split("\n")) {
+                            // Strip node prefix like [node-192.168.5.13]
+                            String cleanLine = line.replaceFirst("^\\[node-[^\\]]+\\]\\s*", "").trim();
+
+                            // Parse: Model name: Intel(R) Core(TM) i7-10700 CPU @ 2.90GHz
+                            if (cleanLine.startsWith("Model name:")) {
+                                cpu.model = cleanLine.replaceFirst("Model name:\\s*", "").trim();
                             }
-                        }
-                        // Parse: Architecture: x86_64
-                        else if (message.contains("Architecture:")) {
-                            cpu.arch = message.replaceFirst(".*Architecture:\\s*", "").trim();
+                            // Parse: CPU(s): 16
+                            else if (cleanLine.startsWith("CPU(s):")) {
+                                Matcher m = Pattern.compile("CPU\\(s\\):\\s*(\\d+)").matcher(cleanLine);
+                                if (m.find()) {
+                                    cpu.cores = m.group(1);
+                                }
+                            }
+                            // Parse: Architecture: x86_64
+                            else if (cleanLine.startsWith("Architecture:")) {
+                                cpu.arch = cleanLine.replaceFirst("Architecture:\\s*", "").trim();
+                            }
                         }
                     }
                 }
@@ -619,8 +630,7 @@ public class SystemInfoAggregator implements CallableByActionName, ActorSystemAw
 
             // Extract GPU-related log entries (lspci VGA, nvidia-smi)
             String sql = "SELECT node_id, message FROM logs " +
-                         "WHERE session_id = ? AND (message LIKE '%VGA%' OR message LIKE '%3D controller%' " +
-                         "OR message LIKE '%NVIDIA%' OR message LIKE '%GeForce%' OR message LIKE '%Radeon%') " +
+                         "WHERE session_id = ? AND message LIKE '%GPU INFO%' " +
                          "ORDER BY node_id, timestamp";
 
             Map<String, List<String>> nodeGpus = new LinkedHashMap<>();
@@ -632,16 +642,22 @@ public class SystemInfoAggregator implements CallableByActionName, ActorSystemAw
                         String nodeId = rs.getString("node_id");
                         String message = rs.getString("message");
 
-                        // Parse GPU name from lspci output
-                        // Pattern: VGA compatible controller: NVIDIA Corporation ... [GeForce RTX 3080]
-                        //          3D controller: NVIDIA Corporation ...
-                        Pattern gpuPattern = Pattern.compile(
-                            "(?:VGA compatible controller|3D controller):\\s*(.+?)(?:\\s*\\(rev|$)"
-                        );
-                        Matcher m = gpuPattern.matcher(message);
-                        if (m.find()) {
-                            String gpu = m.group(1).trim();
-                            nodeGpus.computeIfAbsent(nodeId, k -> new ArrayList<>()).add(gpu);
+                        // Parse each line in the multi-line message
+                        for (String line : message.split("\n")) {
+                            // Strip node prefix like [node-192.168.5.13]
+                            String cleanLine = line.replaceFirst("^\\[node-[^\\]]+\\]\\s*", "").trim();
+
+                            // Parse GPU name from lspci output
+                            // Pattern: VGA compatible controller: NVIDIA Corporation ... [GeForce RTX 3080]
+                            //          3D controller: NVIDIA Corporation ...
+                            Pattern gpuPattern = Pattern.compile(
+                                "(?:VGA compatible controller|3D controller):\\s*(.+?)(?:\\s*\\(rev|$)"
+                            );
+                            Matcher m = gpuPattern.matcher(cleanLine);
+                            if (m.find()) {
+                                String gpu = m.group(1).trim();
+                                nodeGpus.computeIfAbsent(nodeId, k -> new ArrayList<>()).add(gpu);
+                            }
                         }
                     }
                 }
@@ -698,10 +714,9 @@ public class SystemInfoAggregator implements CallableByActionName, ActorSystemAw
         try {
             long sessionId = resolveSessionId(sessionIdStr);
 
-            // Extract memory-related log entries (free -h, /proc/meminfo)
+            // Extract memory-related log entries (free -h output)
             String sql = "SELECT node_id, message FROM logs " +
-                         "WHERE session_id = ? AND (message LIKE '%Mem:%' OR message LIKE '%MemTotal%' " +
-                         "OR message LIKE '%MemAvailable%' OR message LIKE '%Swap:%') " +
+                         "WHERE session_id = ? AND message LIKE '%MEMORY INFO%' " +
                          "ORDER BY node_id, timestamp";
 
             Map<String, MemoryInfo> nodeMemory = new LinkedHashMap<>();
@@ -715,28 +730,34 @@ public class SystemInfoAggregator implements CallableByActionName, ActorSystemAw
 
                         MemoryInfo mem = nodeMemory.computeIfAbsent(nodeId, k -> new MemoryInfo());
 
-                        // Parse: Mem:           31Gi       8.2Gi        20Gi
-                        // Format: Mem: total used free shared buff/cache available
-                        if (message.contains("Mem:") && !message.contains("MemTotal")) {
-                            Pattern memPattern = Pattern.compile(
-                                "Mem:\\s+(\\S+)\\s+(\\S+)\\s+(\\S+)(?:\\s+(\\S+))?(?:\\s+(\\S+))?(?:\\s+(\\S+))?"
-                            );
-                            Matcher m = memPattern.matcher(message);
-                            if (m.find()) {
-                                mem.total = m.group(1);
-                                mem.used = m.group(2);
-                                mem.free = m.group(3);
-                                if (m.group(6) != null) {
-                                    mem.available = m.group(6);
+                        // Parse each line in the multi-line message
+                        for (String line : message.split("\n")) {
+                            // Strip node prefix like [node-192.168.5.13]
+                            String cleanLine = line.replaceFirst("^\\[node-[^\\]]+\\]\\s*", "").trim();
+
+                            // Parse: Mem:           31Gi       8.2Gi        20Gi
+                            // Format: Mem: total used free shared buff/cache available
+                            if (cleanLine.startsWith("Mem:")) {
+                                Pattern memPattern = Pattern.compile(
+                                    "Mem:\\s+(\\S+)\\s+(\\S+)\\s+(\\S+)(?:\\s+(\\S+))?(?:\\s+(\\S+))?(?:\\s+(\\S+))?"
+                                );
+                                Matcher m = memPattern.matcher(cleanLine);
+                                if (m.find()) {
+                                    mem.total = m.group(1);
+                                    mem.used = m.group(2);
+                                    mem.free = m.group(3);
+                                    if (m.group(6) != null) {
+                                        mem.available = m.group(6);
+                                    }
                                 }
                             }
-                        }
-                        // Parse: Swap:         8.0Gi          0B       8.0Gi
-                        else if (message.contains("Swap:")) {
-                            Pattern swapPattern = Pattern.compile("Swap:\\s+(\\S+)");
-                            Matcher m = swapPattern.matcher(message);
-                            if (m.find()) {
-                                mem.swap = m.group(1);
+                            // Parse: Swap:         8.0Gi          0B       8.0Gi
+                            else if (cleanLine.startsWith("Swap:")) {
+                                Pattern swapPattern = Pattern.compile("Swap:\\s+(\\S+)");
+                                Matcher m = swapPattern.matcher(cleanLine);
+                                if (m.find()) {
+                                    mem.swap = m.group(1);
+                                }
                             }
                         }
                     }
@@ -801,12 +822,10 @@ public class SystemInfoAggregator implements CallableByActionName, ActorSystemAw
 
             // Extract network-related log entries (ip addr output)
             String sql = "SELECT node_id, message FROM logs " +
-                         "WHERE session_id = ? AND (message LIKE '%inet %' OR message LIKE '%ether %' " +
-                         "OR message LIKE '%: <%' OR message LIKE '%state UP%' OR message LIKE '%state DOWN%') " +
+                         "WHERE session_id = ? AND message LIKE '%NETWORK INFO%' " +
                          "ORDER BY node_id, timestamp";
 
             Map<String, List<NetworkInfo>> nodeNetworks = new LinkedHashMap<>();
-            Map<String, String> currentInterface = new HashMap<>();
 
             try (PreparedStatement ps = connection.prepareStatement(sql)) {
                 ps.setLong(1, sessionId);
@@ -815,45 +834,37 @@ public class SystemInfoAggregator implements CallableByActionName, ActorSystemAw
                         String nodeId = rs.getString("node_id");
                         String message = rs.getString("message");
 
-                        // Parse interface line: 2: enp0s31f6: <BROADCAST,...> ... state UP
-                        Pattern ifPattern = Pattern.compile("^\\d+:\\s+(\\S+):\\s+<.*>.*state\\s+(\\S+)");
-                        Matcher ifMatcher = ifPattern.matcher(message);
-                        if (ifMatcher.find()) {
-                            String ifName = ifMatcher.group(1);
-                            String state = ifMatcher.group(2);
-                            currentInterface.put(nodeId, ifName);
-                            NetworkInfo net = new NetworkInfo();
-                            net.iface = ifName;
-                            net.state = state;
-                            nodeNetworks.computeIfAbsent(nodeId, k -> new ArrayList<>()).add(net);
-                            continue;
-                        }
+                        List<NetworkInfo> nets = nodeNetworks.computeIfAbsent(nodeId, k -> new ArrayList<>());
+                        NetworkInfo currentNet = null;
 
-                        // Parse inet line: inet 192.168.5.13/24 brd 192.168.5.255
-                        Pattern inetPattern = Pattern.compile("inet\\s+([\\d.]+/\\d+)");
-                        Matcher inetMatcher = inetPattern.matcher(message);
-                        if (inetMatcher.find()) {
-                            String ip = inetMatcher.group(1);
-                            List<NetworkInfo> nets = nodeNetworks.get(nodeId);
-                            if (nets != null && !nets.isEmpty()) {
-                                NetworkInfo lastNet = nets.get(nets.size() - 1);
-                                if (lastNet.ip == null) {
-                                    lastNet.ip = ip;
-                                }
+                        // Parse each line in the multi-line message
+                        for (String line : message.split("\n")) {
+                            // Strip node prefix like [node-192.168.5.13]
+                            String cleanLine = line.replaceFirst("^\\[node-[^\\]]+\\]\\s*", "").trim();
+
+                            // Parse interface line: 2: enp0s31f6: <BROADCAST,...> ... state UP
+                            Pattern ifPattern = Pattern.compile("^\\d+:\\s+(\\S+):\\s+<.*>.*state\\s+(\\S+)");
+                            Matcher ifMatcher = ifPattern.matcher(cleanLine);
+                            if (ifMatcher.find()) {
+                                currentNet = new NetworkInfo();
+                                currentNet.iface = ifMatcher.group(1);
+                                currentNet.state = ifMatcher.group(2);
+                                nets.add(currentNet);
+                                continue;
                             }
-                        }
 
-                        // Parse MAC address: link/ether aa:bb:cc:dd:ee:ff
-                        Pattern macPattern = Pattern.compile("ether\\s+([0-9a-f:]+)");
-                        Matcher macMatcher = macPattern.matcher(message);
-                        if (macMatcher.find()) {
-                            String mac = macMatcher.group(1);
-                            List<NetworkInfo> nets = nodeNetworks.get(nodeId);
-                            if (nets != null && !nets.isEmpty()) {
-                                NetworkInfo lastNet = nets.get(nets.size() - 1);
-                                if (lastNet.mac == null) {
-                                    lastNet.mac = mac;
-                                }
+                            // Parse inet line: inet 192.168.5.13/24 brd 192.168.5.255
+                            Pattern inetPattern = Pattern.compile("inet\\s+([\\d.]+(?:/\\d+)?)");
+                            Matcher inetMatcher = inetPattern.matcher(cleanLine);
+                            if (inetMatcher.find() && currentNet != null && currentNet.ip == null) {
+                                currentNet.ip = inetMatcher.group(1);
+                            }
+
+                            // Parse MAC address: link/ether aa:bb:cc:dd:ee:ff
+                            Pattern macPattern = Pattern.compile("ether\\s+([0-9a-f:]+)");
+                            Matcher macMatcher = macPattern.matcher(cleanLine);
+                            if (macMatcher.find() && currentNet != null && currentNet.mac == null) {
+                                currentNet.mac = macMatcher.group(1);
                             }
                         }
                     }
