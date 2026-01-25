@@ -501,7 +501,7 @@ public class SystemInfoAggregator implements CallableByActionName, ActorSystemAw
 
         JSONObject arg = new JSONObject();
         arg.put("source", "system-info-aggregator");
-        arg.put("type", "plugin-result");
+        arg.put("type", "report");  // shown in --report-only mode
         arg.put("data", data);
         ActionResult result = multiplexer.callByActionName("add", arg.toString());
         if (!result.isSuccess()) {
