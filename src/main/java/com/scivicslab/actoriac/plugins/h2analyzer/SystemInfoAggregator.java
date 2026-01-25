@@ -41,7 +41,6 @@ import java.util.regex.*;
  * <ul>
  *   <li>connect - Connect to H2 database. Args: dbPath</li>
  *   <li>summarize-gpus - Summarize GPU info from logs. Args: sessionId (optional)</li>
- *   <li>list-sessions - List available sessions</li>
  *   <li>disconnect - Disconnect from database</li>
  * </ul>
  *
@@ -71,7 +70,6 @@ public class SystemInfoAggregator implements CallableByActionName, ActorSystemAw
             ActionResult result = switch (actionName) {
                 case "connect" -> connect(args);
                 case "summarize-gpus" -> summarizeGpus(args);
-                case "list-sessions" -> listSessions();
                 case "disconnect" -> disconnect();
                 default -> new ActionResult(false, "Unknown action: " + actionName);
             };
@@ -190,39 +188,6 @@ public class SystemInfoAggregator implements CallableByActionName, ActorSystemAw
             ActionResult result = new ActionResult(false, "Disconnect failed: " + e.getMessage());
             logger.exiting(CLASS_NAME, "disconnect", result);
             return result;
-        }
-    }
-
-    /**
-     * List available sessions.
-     */
-    private ActionResult listSessions() {
-        logger.entering(CLASS_NAME, "listSessions");
-        if (connection == null) {
-            return new ActionResult(false, "Not connected. Use 'connect' first.");
-        }
-
-        try {
-            StringBuilder sb = new StringBuilder();
-            sb.append("Sessions:\n");
-
-            String sql = "SELECT id, workflow_name, status, started_at FROM sessions ORDER BY id DESC LIMIT 10";
-            try (Statement stmt = connection.createStatement();
-                 ResultSet rs = stmt.executeQuery(sql)) {
-                while (rs.next()) {
-                    sb.append(String.format("#%-4d %-30s %-10s %s%n",
-                            rs.getLong("id"),
-                            rs.getString("workflow_name"),
-                            rs.getString("status"),
-                            rs.getTimestamp("started_at")));
-                }
-            }
-
-            String resultStr = sb.toString();
-            reportToMultiplexer(resultStr);
-            return new ActionResult(true, resultStr);
-        } catch (SQLException e) {
-            return new ActionResult(false, "Query failed: " + e.getMessage());
         }
     }
 
