@@ -99,17 +99,16 @@ public class SystemInfoAggregator implements CallableByActionName, ActorSystemAw
     /**
      * Connect to H2 database.
      *
-     * <p>Connection priority:</p>
+     * <p>Connection strategy:</p>
      * <ol>
-     *   <li>Try TCP connection to log server (localhost:29090) first</li>
-     *   <li>Fall back to embedded mode with AUTO_SERVER=TRUE if TCP fails</li>
+     *   <li>Query logServerApi actor to discover the correct log server port</li>
+     *   <li>Use the returned JDBC URL (TCP if server found, embedded otherwise)</li>
      * </ol>
      *
-     * <p>This design ensures the plugin connects to the same database that
-     * actor-IaC is using for logging, even when actor-IaC has started a
-     * background TCP server.</p>
+     * <p>This design ensures the plugin connects to the correct database server
+     * even when multiple actor-IaC instances are running on different ports.</p>
      *
-     * @param dbPath path to database (without .mv.db extension)
+     * @param args database path (JSON array ["path"] or plain string "path")
      */
     private ActionResult connect(String args) {
         logger.entering(CLASS_NAME, "connect", args);
@@ -132,37 +131,22 @@ public class SystemInfoAggregator implements CallableByActionName, ActorSystemAw
                 dbPath = trimmedArgs;
             }
 
+            currentDbPath = dbPath;
+
+            // Get JDBC URL from logServerApi actor
+            // This actor discovers the correct log server port automatically
+            String jdbcUrl = getJdbcUrlFromLogServerApi(dbPath);
+            if (jdbcUrl == null) {
+                // Fallback: use embedded mode if logServerApi is not available
+                jdbcUrl = "jdbc:h2:" + dbPath + ";AUTO_SERVER=TRUE";
+                logger.logp(Level.INFO, CLASS_NAME, "connect",
+                    "logServerApi not available, using fallback URL: {0}", jdbcUrl);
+            }
+
             // Use H2 Driver directly to avoid DriverManager classloader issues
             // when this plugin is loaded via URLClassLoader
             org.h2.Driver driver = new org.h2.Driver();
-            currentDbPath = dbPath;
-
-            // Convert relative path to canonical (normalized) absolute path for TCP URL
-            // Important: Use getCanonicalPath() to normalize "./path" to "/absolute/path"
-            // so H2 TCP server recognizes it as the same database
-            java.io.File dbFile = new java.io.File(dbPath);
-            String absolutePath = dbFile.getCanonicalPath();
-
-            // Try TCP connection first (to existing log server on port 29090)
-            String tcpUrl = "jdbc:h2:tcp://localhost:29090/" + absolutePath;
-            try {
-                connection = driver.connect(tcpUrl, new java.util.Properties());
-                if (connection != null) {
-                    logger.logp(Level.INFO, CLASS_NAME, "connect",
-                        "Connected via TCP to: {0}", tcpUrl);
-                    ActionResult result = new ActionResult(true,
-                        "Connected via TCP to: " + dbPath);
-                    logger.exiting(CLASS_NAME, "connect", result);
-                    return result;
-                }
-            } catch (SQLException tcpEx) {
-                logger.logp(Level.FINE, CLASS_NAME, "connect",
-                    "TCP connection failed, trying embedded mode: {0}", tcpEx.getMessage());
-            }
-
-            // Fall back to embedded mode with AUTO_SERVER
-            String embeddedUrl = "jdbc:h2:" + dbPath + ";AUTO_SERVER=TRUE";
-            connection = driver.connect(embeddedUrl, new java.util.Properties());
+            connection = driver.connect(jdbcUrl, new java.util.Properties());
 
             if (connection == null) {
                 ActionResult result = new ActionResult(false, "Connection returned null for: " + dbPath);
@@ -171,8 +155,8 @@ public class SystemInfoAggregator implements CallableByActionName, ActorSystemAw
             }
 
             logger.logp(Level.INFO, CLASS_NAME, "connect",
-                "Connected in embedded mode to: {0}", embeddedUrl);
-            ActionResult result = new ActionResult(true, "Connected (embedded) to: " + dbPath);
+                "Connected to: {0}", jdbcUrl);
+            ActionResult result = new ActionResult(true, "Connected to: " + dbPath);
             logger.exiting(CLASS_NAME, "connect", result);
             return result;
         } catch (SQLException e) {
@@ -180,12 +164,47 @@ public class SystemInfoAggregator implements CallableByActionName, ActorSystemAw
             logger.logp(Level.WARNING, CLASS_NAME, "connect", "SQLException occurred", e);
             logger.exiting(CLASS_NAME, "connect", result);
             return result;
-        } catch (java.io.IOException e) {
-            ActionResult result = new ActionResult(false, "Path resolution failed: " + e.getMessage());
-            logger.logp(Level.WARNING, CLASS_NAME, "connect", "IOException occurred", e);
-            logger.exiting(CLASS_NAME, "connect", result);
-            return result;
         }
+    }
+
+    /**
+     * Gets JDBC URL from logServerApi actor.
+     *
+     * <p>The logServerApi actor discovers running log servers and returns
+     * the appropriate JDBC URL (TCP mode if server found, embedded mode otherwise).</p>
+     *
+     * @param dbPath the database path
+     * @return JDBC URL string, or null if logServerApi is not available
+     */
+    private String getJdbcUrlFromLogServerApi(String dbPath) {
+        logger.entering(CLASS_NAME, "getJdbcUrlFromLogServerApi", dbPath);
+        if (system == null) {
+            logger.logp(Level.FINE, CLASS_NAME, "getJdbcUrlFromLogServerApi", "system is null");
+            logger.exiting(CLASS_NAME, "getJdbcUrlFromLogServerApi", null);
+            return null;
+        }
+
+        IIActorRef<?> logServerApi = system.getIIActor("logServerApi");
+        if (logServerApi == null) {
+            logger.logp(Level.FINE, CLASS_NAME, "getJdbcUrlFromLogServerApi",
+                "logServerApi actor not found");
+            logger.exiting(CLASS_NAME, "getJdbcUrlFromLogServerApi", null);
+            return null;
+        }
+
+        ActionResult result = logServerApi.callByActionName("getJdbcUrl", dbPath);
+        if (!result.isSuccess()) {
+            logger.logp(Level.WARNING, CLASS_NAME, "getJdbcUrlFromLogServerApi",
+                "logServerApi.getJdbcUrl failed: {0}", result.getResult());
+            logger.exiting(CLASS_NAME, "getJdbcUrlFromLogServerApi", null);
+            return null;
+        }
+
+        String jdbcUrl = result.getResult();
+        logger.logp(Level.INFO, CLASS_NAME, "getJdbcUrlFromLogServerApi",
+            "Got JDBC URL from logServerApi: {0}", jdbcUrl);
+        logger.exiting(CLASS_NAME, "getJdbcUrlFromLogServerApi", jdbcUrl);
+        return jdbcUrl;
     }
 
     /**
@@ -763,7 +782,7 @@ public class SystemInfoAggregator implements CallableByActionName, ActorSystemAw
                      "WHERE session_id = ? AND message LIKE '%GPU INFO%' " +
                      "ORDER BY node_id, timestamp";
 
-        Map<String, List<String>> nodeGpus = new LinkedHashMap<>();
+        Map<String, GpuFullInfo> nodeGpus = new LinkedHashMap<>();
 
         try (PreparedStatement ps = connection.prepareStatement(sql)) {
             ps.setLong(1, sessionId);
@@ -771,24 +790,45 @@ public class SystemInfoAggregator implements CallableByActionName, ActorSystemAw
                 while (rs.next()) {
                     String nodeId = rs.getString("node_id");
                     String message = rs.getString("message");
+                    GpuFullInfo gpuInfo = nodeGpus.computeIfAbsent(nodeId, k -> new GpuFullInfo());
+
                     for (String line : message.split("\n")) {
                         String cleanLine = line.replaceFirst("^\\[node-[^\\]]+\\]\\s*", "").trim();
                         if (cleanLine.contains("GPU INFO") || cleanLine.isEmpty()) continue;
 
-                        Pattern lspciPattern = Pattern.compile(
-                            "(?:VGA compatible controller|3D controller|Display controller):\\s*(.+?)(?:\\s*\\(rev|$)");
-                        Matcher m = lspciPattern.matcher(cleanLine);
-                        if (m.find()) {
-                            nodeGpus.computeIfAbsent(nodeId, k -> new ArrayList<>()).add(m.group(1).trim());
+                        // Parse CUDA_VERSION line
+                        if (cleanLine.startsWith("CUDA_VERSION:")) {
+                            gpuInfo.cudaVersion = cleanLine.replaceFirst("CUDA_VERSION:\\s*", "").trim();
                             continue;
                         }
-                        if (cleanLine.startsWith("NVIDIA") || cleanLine.contains("GeForce") ||
-                            cleanLine.contains("Quadro") || cleanLine.contains("Tesla") ||
-                            cleanLine.contains("A100") || cleanLine.contains("H100") ||
-                            cleanLine.contains("DGX")) {
-                            String gpu = cleanLine.split(",")[0].trim();
-                            if (!gpu.isEmpty() && !gpu.equals("No GPU detected via lspci")) {
-                                nodeGpus.computeIfAbsent(nodeId, k -> new ArrayList<>()).add(gpu);
+
+                        // Parse nvidia-smi CSV output: name, memory.total, driver_version, compute_cap
+                        // Example: "NVIDIA GeForce RTX 4080, 16384 MiB, 550.54.14, 8.9"
+                        Pattern nvidiaCsvPattern = Pattern.compile(
+                            "^(NVIDIA [^,]+|[^,]*GeForce[^,]*|[^,]*Quadro[^,]*|[^,]*Tesla[^,]*|[^,]*A100[^,]*|[^,]*H100[^,]*|[^,]*GB[0-9]+[^,]*),\\s*(\\d+)\\s*MiB,\\s*([\\d.]+),\\s*([\\d.]+)$"
+                        );
+                        Matcher nvidiaMatcher = nvidiaCsvPattern.matcher(cleanLine);
+                        if (nvidiaMatcher.find()) {
+                            gpuInfo.name = nvidiaMatcher.group(1).trim();
+                            int vramMB = Integer.parseInt(nvidiaMatcher.group(2));
+                            gpuInfo.vram = (vramMB >= 1024) ? (vramMB / 1024) + "GB" : vramMB + "MB";
+                            gpuInfo.driver = nvidiaMatcher.group(3).trim();
+                            gpuInfo.computeCap = nvidiaMatcher.group(4).trim();
+                            continue;
+                        }
+
+                        // Parse lspci output for AMD/Intel GPUs
+                        Pattern lspciPattern = Pattern.compile(
+                            "(?:VGA compatible controller|3D controller|Display controller):\\s*(.+?)(?:\\s*\\(rev|$)");
+                        Matcher lspciMatcher = lspciPattern.matcher(cleanLine);
+                        if (lspciMatcher.find()) {
+                            String gpuName = lspciMatcher.group(1).trim();
+                            if (gpuInfo.name == null) {
+                                gpuInfo.name = gpuName;
+                                gpuInfo.driver = gpuName.contains("AMD") ? "amdgpu" : "-";
+                                gpuInfo.vram = "-";
+                                gpuInfo.computeCap = "-";
+                                gpuInfo.cudaVersion = "-";
                             }
                         }
                     }
@@ -798,17 +838,62 @@ public class SystemInfoAggregator implements CallableByActionName, ActorSystemAw
 
         if (nodeGpus.isEmpty()) return null;
 
-        StringBuilder sb = new StringBuilder();
-        sb.append("## GPU Summary\n");
-        sb.append("| node | gpu |\n");
-        sb.append("|------|-----|\n");
-        for (Map.Entry<String, List<String>> entry : nodeGpus.entrySet()) {
-            String nodeShort = entry.getKey().replaceFirst("^node-", "");
-            for (String gpu : entry.getValue()) {
-                sb.append(String.format("| %s | %s |%n", nodeShort, gpu));
+        // Count GPU types
+        int nvidiaCount = 0, amdCount = 0, otherCount = 0;
+        for (GpuFullInfo gpu : nodeGpus.values()) {
+            if (gpu.name != null) {
+                if (gpu.name.contains("NVIDIA") || gpu.name.contains("GeForce") ||
+                    gpu.name.contains("Quadro") || gpu.name.contains("Tesla")) {
+                    nvidiaCount++;
+                } else if (gpu.name.contains("AMD") || gpu.name.contains("Radeon")) {
+                    amdCount++;
+                } else {
+                    otherCount++;
+                }
             }
         }
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("## GPU Summary\n");
+        sb.append("| node | gpu | vram | driver | cuda | compute_cap |\n");
+        sb.append("|------|-----|------|--------|------|-------------|\n");
+        for (Map.Entry<String, GpuFullInfo> entry : nodeGpus.entrySet()) {
+            String nodeShort = entry.getKey().replaceFirst("^node-", "");
+            GpuFullInfo gpu = entry.getValue();
+            if (gpu.name != null) {
+                sb.append(String.format("| %s | %s | %s | %s | %s | %s |%n",
+                        nodeShort,
+                        gpu.name,
+                        gpu.vram != null ? gpu.vram : "-",
+                        gpu.driver != null ? gpu.driver : "-",
+                        gpu.cudaVersion != null ? gpu.cudaVersion : "-",
+                        gpu.computeCap != null ? gpu.computeCap : "-"));
+            }
+        }
+
+        sb.append("\nSummary: ");
+        if (nvidiaCount > 0) sb.append(nvidiaCount).append(" NVIDIA");
+        if (amdCount > 0) {
+            if (nvidiaCount > 0) sb.append(", ");
+            sb.append(amdCount).append(" AMD");
+        }
+        if (otherCount > 0) {
+            if (nvidiaCount > 0 || amdCount > 0) sb.append(", ");
+            sb.append(otherCount).append(" Other");
+        }
+
         return sb.toString();
+    }
+
+    /**
+     * GPU full information holder.
+     */
+    private static class GpuFullInfo {
+        String name;
+        String vram;
+        String driver;
+        String cudaVersion;
+        String computeCap;
     }
 
     /**
