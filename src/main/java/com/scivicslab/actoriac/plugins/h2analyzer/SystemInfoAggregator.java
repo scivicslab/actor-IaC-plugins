@@ -227,6 +227,8 @@ public class SystemInfoAggregator implements CallableByActionName, ActorSystemAw
                      ") AND (message LIKE '%GPU INFO%' OR message LIKE '%NVIDIA%' " +
                      "OR message LIKE '%GeForce%' OR message LIKE '%Quadro%' " +
                      "OR message LIKE '%CUDA_VERSION%' OR message LIKE '%Radeon%' " +
+                     "OR message LIKE '%AMD_GPU%' OR message LIKE '%ROCM_VERSION%' " +
+                     "OR message LIKE '%GFX_ARCH%' OR message LIKE '%GPU_NAME%' " +
                      "OR message LIKE '%AMD%' OR message LIKE '%VGA%') " +
                      "ORDER BY actor_name, timestamp";
 
@@ -245,9 +247,41 @@ public class SystemInfoAggregator implements CallableByActionName, ActorSystemAw
                         String cleanLine = line.replaceFirst("^\\[node-[^\\]]+\\]\\s*", "").trim();
                         if (cleanLine.contains("GPU INFO") || cleanLine.isEmpty()) continue;
 
-                        // Parse CUDA_VERSION line
+                        // Parse NVIDIA CUDA_VERSION line
                         if (cleanLine.startsWith("CUDA_VERSION:")) {
-                            gpuInfo.cudaVersion = cleanLine.replaceFirst("CUDA_VERSION:\\s*", "").trim();
+                            gpuInfo.toolkit = "CUDA " + cleanLine.replaceFirst("CUDA_VERSION:\\s*", "").trim();
+                            continue;
+                        }
+
+                        // Parse AMD ROCm output
+                        if (cleanLine.startsWith("AMD_GPU:")) {
+                            gpuInfo.isAmd = true;
+                            continue;
+                        }
+                        if (cleanLine.startsWith("GPU_NAME:")) {
+                            gpuInfo.name = cleanLine.replaceFirst("GPU_NAME:\\s*", "").trim();
+                            continue;
+                        }
+                        if (cleanLine.startsWith("VRAM_BYTES:")) {
+                            try {
+                                long vramBytes = Long.parseLong(cleanLine.replaceFirst("VRAM_BYTES:\\s*", "").trim());
+                                long vramGB = vramBytes / (1024L * 1024L * 1024L);
+                                gpuInfo.vram = vramGB + "GB";
+                            } catch (NumberFormatException e) {
+                                // ignore
+                            }
+                            continue;
+                        }
+                        if (cleanLine.startsWith("DRIVER_VERSION:")) {
+                            gpuInfo.driver = cleanLine.replaceFirst("DRIVER_VERSION:\\s*", "").trim();
+                            continue;
+                        }
+                        if (cleanLine.startsWith("ROCM_VERSION:")) {
+                            gpuInfo.toolkit = "ROCm " + cleanLine.replaceFirst("ROCM_VERSION:\\s*", "").trim();
+                            continue;
+                        }
+                        if (cleanLine.startsWith("GFX_ARCH:")) {
+                            gpuInfo.arch = cleanLine.replaceFirst("GFX_ARCH:\\s*", "").trim();
                             continue;
                         }
 
@@ -261,11 +295,11 @@ public class SystemInfoAggregator implements CallableByActionName, ActorSystemAw
                             int vramMB = Integer.parseInt(nvidiaMatcher.group(2));
                             gpuInfo.vram = (vramMB >= 1024) ? (vramMB / 1024) + "GB" : vramMB + "MB";
                             gpuInfo.driver = nvidiaMatcher.group(3).trim();
-                            gpuInfo.computeCap = nvidiaMatcher.group(4).trim();
+                            gpuInfo.arch = nvidiaMatcher.group(4).trim();
                             continue;
                         }
 
-                        // Parse lspci output for AMD/Intel GPUs
+                        // Parse lspci output for AMD/Intel GPUs (fallback when no ROCm)
                         Pattern lspciPattern = Pattern.compile(
                             "(?:VGA compatible controller|3D controller|Display controller):\\s*(.+?)(?:\\s*\\(rev|$)");
                         Matcher lspciMatcher = lspciPattern.matcher(cleanLine);
@@ -273,10 +307,10 @@ public class SystemInfoAggregator implements CallableByActionName, ActorSystemAw
                             String gpuName = lspciMatcher.group(1).trim();
                             if (gpuInfo.name == null) {
                                 gpuInfo.name = gpuName;
-                                gpuInfo.driver = gpuName.contains("AMD") ? "amdgpu" : "-";
+                                gpuInfo.driver = "-";
                                 gpuInfo.vram = "-";
-                                gpuInfo.computeCap = "-";
-                                gpuInfo.cudaVersion = "-";
+                                gpuInfo.arch = "-";
+                                gpuInfo.toolkit = "-";
                             }
                         }
                     }
@@ -293,7 +327,7 @@ public class SystemInfoAggregator implements CallableByActionName, ActorSystemAw
                 if (gpu.name.contains("NVIDIA") || gpu.name.contains("GeForce") ||
                     gpu.name.contains("Quadro") || gpu.name.contains("Tesla")) {
                     nvidiaCount++;
-                } else if (gpu.name.contains("AMD") || gpu.name.contains("Radeon")) {
+                } else if (gpu.isAmd || gpu.name.contains("AMD") || gpu.name.contains("Radeon")) {
                     amdCount++;
                 } else {
                     otherCount++;
@@ -303,8 +337,8 @@ public class SystemInfoAggregator implements CallableByActionName, ActorSystemAw
 
         StringBuilder sb = new StringBuilder();
         sb.append("## GPU Summary\n");
-        sb.append("| node | gpu | vram | driver | cuda | compute_cap |\n");
-        sb.append("|------|-----|------|--------|------|-------------|\n");
+        sb.append("| node | gpu | vram | driver | toolkit | arch |\n");
+        sb.append("|------|-----|------|--------|---------|------|\n");
         for (Map.Entry<String, GpuInfo> entry : nodeGpus.entrySet()) {
             String nodeShort = entry.getKey().replaceFirst("^node-", "");
             GpuInfo gpu = entry.getValue();
@@ -314,8 +348,8 @@ public class SystemInfoAggregator implements CallableByActionName, ActorSystemAw
                         gpu.name,
                         gpu.vram != null ? gpu.vram : "-",
                         gpu.driver != null ? gpu.driver : "-",
-                        gpu.cudaVersion != null ? gpu.cudaVersion : "-",
-                        gpu.computeCap != null ? gpu.computeCap : "-"));
+                        gpu.toolkit != null ? gpu.toolkit : "-",
+                        gpu.arch != null ? gpu.arch : "-"));
             }
         }
 
@@ -388,7 +422,8 @@ public class SystemInfoAggregator implements CallableByActionName, ActorSystemAw
         String name;
         String vram;
         String driver;
-        String cudaVersion;
-        String computeCap;
+        String toolkit;  // CUDA x.x or ROCm x.x
+        String arch;     // compute cap (NVIDIA) or gfx ID (AMD)
+        boolean isAmd;
     }
 }
