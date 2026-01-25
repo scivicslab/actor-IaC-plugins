@@ -307,10 +307,6 @@ public class SystemInfoAggregator implements CallableByActionName, ActorSystemAw
                             String gpuName = lspciMatcher.group(1).trim();
                             if (gpuInfo.name == null) {
                                 gpuInfo.name = gpuName;
-                                gpuInfo.driver = "-";
-                                gpuInfo.vram = "-";
-                                gpuInfo.arch = "-";
-                                gpuInfo.toolkit = "-";
                             }
                         }
                     }
@@ -337,19 +333,23 @@ public class SystemInfoAggregator implements CallableByActionName, ActorSystemAw
 
         StringBuilder sb = new StringBuilder();
         sb.append("## GPU Summary\n");
-        sb.append("| node | gpu | vram | driver | toolkit | arch |\n");
-        sb.append("|------|-----|------|--------|---------|------|\n");
         for (Map.Entry<String, GpuInfo> entry : nodeGpus.entrySet()) {
             String nodeShort = entry.getKey().replaceFirst("^node-", "");
             GpuInfo gpu = entry.getValue();
             if (gpu.name != null) {
-                sb.append(String.format("| %s | %s | %s | %s | %s | %s |%n",
-                        nodeShort,
-                        gpu.name,
-                        gpu.vram != null ? gpu.vram : "-",
-                        gpu.driver != null ? gpu.driver : "-",
-                        gpu.toolkit != null ? gpu.toolkit : "-",
-                        gpu.arch != null ? gpu.arch : "-"));
+                sb.append(String.format("%s, gpu, %s%n", nodeShort, gpu.name));
+            }
+            if (gpu.vram != null) {
+                sb.append(String.format("%s, vram, %s%n", nodeShort, gpu.vram));
+            }
+            if (gpu.driver != null) {
+                sb.append(String.format("%s, driver, %s%n", nodeShort, gpu.driver));
+            }
+            if (gpu.toolkit != null) {
+                sb.append(String.format("%s, toolkit, %s%n", nodeShort, gpu.toolkit));
+            }
+            if (gpu.arch != null) {
+                sb.append(String.format("%s, arch, %s%n", nodeShort, gpu.arch));
             }
         }
 
