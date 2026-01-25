@@ -286,14 +286,18 @@ public class SystemInfoAggregator implements CallableByActionName, ActorSystemAw
                         }
 
                         // Parse nvidia-smi CSV output: name, memory.total, driver_version, compute_cap
+                        // Memory can be "16384 MiB" or "[N/A]"
                         Pattern nvidiaCsvPattern = Pattern.compile(
-                            "^(NVIDIA [^,]+|[^,]*GeForce[^,]*|[^,]*Quadro[^,]*|[^,]*Tesla[^,]*|[^,]*A100[^,]*|[^,]*H100[^,]*|[^,]*GB[0-9]+[^,]*),\\s*(\\d+)\\s*MiB,\\s*([\\d.]+),\\s*([\\d.]+)$"
+                            "^(NVIDIA [^,]+|[^,]*GeForce[^,]*|[^,]*Quadro[^,]*|[^,]*Tesla[^,]*|[^,]*A100[^,]*|[^,]*H100[^,]*|[^,]*GB[0-9]+[^,]*),\\s*(?:(\\d+)\\s*MiB|\\[N/A\\]),\\s*([\\d.]+),\\s*([\\d.]+)$"
                         );
                         Matcher nvidiaMatcher = nvidiaCsvPattern.matcher(cleanLine);
                         if (nvidiaMatcher.find()) {
                             gpuInfo.name = nvidiaMatcher.group(1).trim();
-                            int vramMB = Integer.parseInt(nvidiaMatcher.group(2));
-                            gpuInfo.vram = (vramMB >= 1024) ? (vramMB / 1024) + "GB" : vramMB + "MB";
+                            String vramStr = nvidiaMatcher.group(2);
+                            if (vramStr != null) {
+                                int vramMB = Integer.parseInt(vramStr);
+                                gpuInfo.vram = (vramMB >= 1024) ? (vramMB / 1024) + "GB" : vramMB + "MB";
+                            }
                             gpuInfo.driver = nvidiaMatcher.group(3).trim();
                             gpuInfo.arch = nvidiaMatcher.group(4).trim();
                             continue;
